@@ -1,0 +1,631 @@
+---
+title: "PEC2"
+author: "Francesc Torrents Torre"
+date: "2024-12-20"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "https://cran.rstudio.com/"))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install(c("arrayQualityMetrics", "limma", "annotate", "mouse4302.db", 
+                       "clusterProfiler", "org.Mm.eg.db", "DOSE"))
+if (!requireNamespace("mouse4302.db", quietly = TRUE)) {
+  BiocManager::install("mouse4302.db")
+}
+
+library(affy)
+library(stats)
+library(arrayQualityMetrics)
+library(limma)
+library(VennDiagram)
+library(annotate)
+library(mouse4302.db)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(DOSE)
+```
+
+# Introducción y Objetivos
+
+En esta PEC, una vez familiarizados con los datos de expresión, y los métodos y herramientas para la selección de genes y el análisis de la significación biológica, procedemos a la realización de un análisis de datos, que nos permitirá mejorar nuestra comprensión de un problema biológico mediante métodos y herramientas estadísticas y bioinformáticas.
+
+Se basa en los datos de un estudio que, utilizando un modelo murino se investiga la utilidad de los antibióticos LINEOLID y VANCOMICINA para inmunomodulación durante infecciones por Staphylococcus aureus resistente a meticilina (MRSA).
+
+Los resultados se subiran al repositorio github siguiente: https://github.com/Frantt96/Torrents-Torre-Francesc-PEC2
+
+# Métodos
+
+El análisis se basa en un dataset con un total de 35 muestras, 15 de ellas tomadas antes de la infeccion y 20 despues. Estas se pueden extraer de los archivos facilitados por el profesor y en la pagina web: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE38531 
+
+Se generaran 3 listas de genes que deberan ser caracterizadas mediante análisis de significación biológica y finalmente compararse entre ellas. 
+Antes de empezar con el analisis, hay que realizar una preparación de los datos suministrados.
+
+
+
+# Resultados
+
+Primero de todo, prescindimos de las cinco muestras tomadas a las 2 horas y sorteamos las muestras restantes de forma que se conserven tan sólo cuatro muestras de cada grupo. 
+Esto es realizado a traves de la función selectSamples que está disponible en el archivo facilitado en el campus "selectSamples.R". Nos permite extraer 24 muestras distintas indicando el DNI (77129830) como semilla.
+
+```{r}
+filter_microarray <- function(allTargets, seed = 77129830) {
+  # Configurar la semilla aleatoria
+  set.seed(77129830)
+  
+  # Filtrar las filas donde 'time' no sea 'hour 2'
+  filtered <- subset(allTargets, time != "hour 2")
+  
+  # Dividir el dataset por grupos únicos de 'infection' + 'agent'
+  filtered$group <- interaction(filtered$infection, filtered$agent)
+  
+  # Seleccionar 4 muestras al azar de cada grupo
+  selected <- do.call(rbind, lapply(split(filtered, filtered$group), function(group_data) {
+    if (nrow(group_data) > 4) {
+      group_data[sample(1:nrow(group_data), 4), ]
+    } else {
+      group_data
+    }
+  }))
+  
+  # Obtener los índices originales como nombres de las filas seleccionadas
+  original_indices <- match(selected$sample, allTargets$sample)
+  
+  # Modificar los rownames usando 'sample' y los índices originales
+  rownames(selected) <- paste0(selected$sample, ".", original_indices)
+  
+  # Eliminar la columna 'group' y devolver el resultado
+  selected$group <- NULL
+  return(selected)
+}
+
+
+
+# Simular el dataset basado en la descripción proporcionada
+allTargets <- data.frame(
+  sample = c("GSM944831", "GSM944838", "GSM944845", "GSM944852", "GSM944859",
+             "GSM944833", "GSM944840", "GSM944847", "GSM944854", "GSM944861",
+             "GSM944834", "GSM944841", "GSM944848", "GSM944855", "GSM944862",
+             "GSM944832", "GSM944839", "GSM944846", "GSM944853", "GSM944860",
+             "GSM944835", "GSM944842", "GSM944849", "GSM944856", "GSM944863",
+             "GSM944836", "GSM944843", "GSM944850", "GSM944857", "GSM944864",
+             "GSM944837", "GSM944844", "GSM944851", "GSM944858", "GSM944865"),
+  infection = c(rep("uninfected", 15), rep("S. aureus USA300", 20)),
+  time = c(rep("hour 0", 15), rep("hour 2", 5), rep("hour 24", 15)),
+  agent = c(rep("untreated", 5), rep("linezolid", 5), rep("vancomycin", 5),
+            rep("untreated", 5), rep("untreated", 5), rep("linezolid", 5), rep("vancomycin", 5))
+)
+
+# Aplicar la función (cambiar 123 por vuestro ID de la UOC u otro número que podáis escribir en el documento)
+result <- filter_microarray(allTargets, seed=77129830)
+
+
+print(result)
+```
+
+Se comprueba que todas las instrucciones del enunciado se cumplen.
+
+Una vez aplicada la función selectSamples, obtendremos un nuevo objeto (result) que nos permitirá la creación de un nuevo ExpressionSet leyendo unicamente aquellos archivos .CEL que se hayan seleccionado.
+
+En la carpeta donde residen todos los archivos .CEL se pueden eliminar manualmente los que no corresponden a las muestras que usaremos. 
+
+
+```{r}
+# Obtenemos los nombres de los archivos en la carpeta GSE38531_RAW
+cel_files_in_directory <- list.files(path = "GSE38531_RAW", pattern = "\\.CEL$", full.names = TRUE)
+
+# Verificamos los nombres en 'result' y mapearlos con los archivos reales
+sample_names <- gsub("\\..*", "", rownames(result)) 
+matched_files <- sapply(sample_names, function(sample) {
+  # Buscamos en los archivos el que contiene el nombre de la muestra
+  file <- grep(sample, cel_files_in_directory, value = TRUE)
+  if (length(file) == 1) {
+    return(file)
+  } else {
+    return(NA)  # Si no se encuentra = NA
+  }
+})
+
+# Comprobamos si faltan archivos
+missing <- which(is.na(matched_files))
+if (length(missing) > 0) {
+  cat("Faltan archivos para las siguientes muestras:\n")
+  print(sample_names[missing])
+} else {
+  cat("Todos los archivos han sido mapeados correctamente.\n")
+}
+
+
+
+library(affy)
+
+# Leemos los datos crudos desde los archivos mapeados
+raw_data <- ReadAffy(filenames = matched_files)
+
+# Revisamos los datos
+summary(raw_data)
+
+# Normalizamos los datos
+normalized_data <- rma(raw_data)
+
+# Agregamos información de las muestras desde 'result'
+pData(normalized_data) <- result
+
+# Verificamos ExpressionSet
+print(normalized_data)
+
+```
+
+Los datos, una vez normalizados utilizando el algoritmo RMA, seran utilizados para realizar el Análisis Exploratorio y el Control de Calidad. 
+
+Inicialmente realizamos gráficos para evaluar la distribución de las expresiones y detectar posibles problemas: 
+
+
+```{r}
+# Boxplot para verificar distribuciones
+
+short_labels <- gsub("_.*", "", colnames(exprs(normalized_data)))
+boxplot(exprs(normalized_data),
+        main = "Distribución de valores de expresión normalizados",
+        xlab = "Muestras", ylab = "Intensidad",
+        names = short_labels, las = 2, col = "lightblue", cex.axis = 0.8)
+
+```
+
+Este gráfico nos muestra las distribuciones de valores de expresión normalizados para cada muestra. Los resultados nos muestran que tienen distribuciones similares en cuanto a rango/intensidad. No se observan muestras con distribuciones con diferencias considerables. 
+
+
+```{r}
+# PCA (Análisis de Componentes Principales) para observar agrupamiento
+library(stats)
+pca <- prcomp(t(exprs(normalized_data)), scale. = TRUE)
+plot(pca$x[, 1:2], col = as.factor(result$infection),
+     pch = 19, main = "PCA de las muestras (Componentes 1 y 2)",
+     xlab = "PC1", ylab = "PC2")
+legend("topright", legend = unique(result$infection),
+       col = 1:length(unique(result$infection)), pch = 19)
+
+```
+
+En este gráfico se busca visualizar la separación entre grupos de muestras (infectados vs no infectados)
+Los puntos negros representan muestras infectadas por S.aureus mientras que los puntos rojos representan muestras que no han sido infectadas por esta bacteria. 
+Se puede observar una clara separación entre los dos grupos en las primeras dos componentes, sugiriendo diferencias biológicas entre infectados y no infectados. Dentro de cada grupo, las muestras parecen estar agrupadas con coherencia. 
+
+```{r}
+library(arrayQualityMetrics)
+
+# Generar reporte de calidad
+arrayQualityMetrics(expressionset = normalized_data,
+                    outdir = "QualityControlReport",
+                    force = TRUE)
+```
+
+Generamos un reporte de calidad. Está disponible en el siguiente enlace:
+
+[Reporte de calidad - arrayQualityMetrics](QualityControlReport/index.html)
+
+
+
+## Filtrado de los datos
+
+Para quedarnos con el 10% de las sondas con mayor variabilidad, necesitamos calcular la desviación estándar de cada sonda a lo largo de las muestras que tenemos. 
+Generaremos un vector donde cada valor corresponde a la desviación estándar de una sonda.
+
+```{r}
+variability <- apply(exprs(normalized_data), 1, sd)
+summary(variability)
+```
+
+Ahora, calcularemos el umbral del percentil 90 para quedarnos con el 10% de las sondas más variables: 
+
+```{r}
+threshold <- quantile(variability, 0.9)
+threshold
+```
+
+El resultado es: el umbral para el 10% superior es 0.4086203, lo que indica que nos quedaremos con las sondas cuya desviación estándar sea mayor a este valor (generando un nuevo ExpressionSet con las sondas filtradas)
+
+```{r}
+# Filtramoslas sondas que superen el umbral de variabilidad
+filtered_indices <- which(variability > threshold)
+filtered_data <- normalized_data[filtered_indices, ]
+
+# Verificamos las dimensiones 
+dim(filtered_data)
+```
+
+Ahora nos hemos quedado con 4510 sondas (en comparación con las 45101 originales.)
+
+
+## Construcción de las matrices de diseño y de contrastes 
+
+La matriz de diseño define las condiciones experimetnales de las muestras. Utilizaremos la información que hemos obtenido anteriormente para crearla. 
+
+```{r}
+library(limma)
+
+# Creamos una nueva variable que combine infección y agente
+pData(filtered_data)$group <- interaction(pData(filtered_data)$infection, 
+                                          pData(filtered_data)$agent, sep = "_")
+
+# Verificamos los grupos únicos
+unique(pData(filtered_data)$group)
+
+# Creamos la matriz de diseño
+design <- model.matrix(~ 0 + group, data = pData(filtered_data))
+
+# Renombramos las columnas para que sean más legibles
+colnames(design) <- levels(pData(filtered_data)$group)
+
+# Verificamos la matriz
+design
+
+```
+
+Cada columna representa una combinación especifica de las condiciones experimentales, y las filas corresponden a las muestras. Las columnas nos indican si la muestra pertenece al grupo infectado o no y si reciben tratamiento o no (1 para sí, 0 para no).
+
+
+```{r}
+# Corregimos los nombres de las columnas de la matriz de diseño
+colnames(design) <- make.names(colnames(design))
+colnames(design)
+
+# Creamos la matriz de contrastes con los nombres exactos de las columnas de diseño
+contrast_matrix <- makeContrasts(
+  Infectados_vs_NoInfectados = S..aureus.USA300_untreated - uninfected_untreated,
+  Linezolid = S..aureus.USA300_linezolid - uninfected_linezolid,
+  Vancomicina = S..aureus.USA300_vancomycin - uninfected_vancomycin,
+  levels = design
+)
+
+# Verificamos
+contrast_matrix
+```
+
+La matriz de contrastes especifica las comparaciones propuestas:
+- Compara muestras infectadas con no infectadas
+- Compara muestras infectadas tratadas con linezolid con no infectadas tratadas con linezolid
+- Compara muestras infectadas tratadas con vancomicina con no infectadas tratadas con vancomicina. 
+
+
+Con la matriz de diseño y de contrastes, podemos aplicar un modelo ajustado: 
+
+```{r}
+fit <- lmFit(exprs(filtered_data), design)
+
+# Aplicamos los contrastes
+fit_contrasts <- contrasts.fit(fit, contrast_matrix)
+
+# Estimación Bayesiana
+fit_contrasts <- eBayes(fit_contrasts)
+summary(decideTests(fit_contrasts))
+```
+
+El resumen de los resultados muestra el numero de genes diferencialmente expresados para cada comparación. Se puede observar que hay una gran cantidad de genes diferencialmente expresados en las tres comparaciones, indicando diferencias claras entre los grupos. La Vancomicina parece tener el mayor impacto en la reduccion de la expresión génica en comparación con Linezolid.
+
+
+## Obtención de las listas de genes diferencialmente expresados para cada comparación
+
+Se utiliza la funcion topTable de limma para la obtención de los genes diferencialmente expresados en cada comparación.
+
+```{r}
+# Obtener las listas de genes diferencialmente expresados
+topTable_Inf_vs_NoInf <- topTable(fit_contrasts, coef = "Infectados_vs_NoInfectados", number = Inf, adjust = "BH")
+topTable_Linezolid <- topTable(fit_contrasts, coef = "Linezolid", number = Inf, adjust = "BH")
+topTable_Vancomicina <- topTable(fit_contrasts, coef = "Vancomicina", number = Inf, adjust = "BH")
+
+# Visualizar los primeros genes de cada lista
+head(topTable_Inf_vs_NoInf)
+head(topTable_Linezolid)
+head(topTable_Vancomicina)
+
+```
+
+Esto nos muestra el listado de todos los genes diferencialmente expresados. No obstante, podemos filtrar las listas para obtener solo los genes con un p-value ajustado por debajo del umbral (0.05)
+
+```{r}
+# Filtro de genes diferencialmente expresados (p-valor ajustado < 0.05)
+DEGs_Inf_vs_NoInf <- topTable_Inf_vs_NoInf[topTable_Inf_vs_NoInf$adj.P.Val < 0.05, ]
+DEGs_Linezolid <- topTable_Linezolid[topTable_Linezolid$adj.P.Val < 0.05, ]
+DEGs_Vancomicina <- topTable_Vancomicina[topTable_Vancomicina$adj.P.Val < 0.05, ]
+
+# Verificar el número de genes significativos
+nrow(DEGs_Inf_vs_NoInf)
+nrow(DEGs_Linezolid)
+nrow(DEGs_Vancomicina)
+```
+
+
+Pasamos a comparar las listas de genes utilizando gráficos, en este caso el diagrama de Venn (visualización de la intersección de genes entre las listas)
+
+```{r}
+# Instalar paquete VennDiagram si no está instalado
+if (!requireNamespace("VennDiagram", quietly = TRUE)) install.packages("VennDiagram")
+library(VennDiagram)
+
+# Extraer los IDs de genes de cada lista
+genes_Inf_vs_NoInf <- rownames(DEGs_Inf_vs_NoInf)
+genes_Linezolid <- rownames(DEGs_Linezolid)
+genes_Vancomicina <- rownames(DEGs_Vancomicina)
+
+# Crear el diagrama de Venn
+venn.plot <- venn.diagram(
+  x = list(Infectados_vs_NoInfectados = genes_Inf_vs_NoInf,
+           Linezolid = genes_Linezolid,
+           Vancomicina = genes_Vancomicina),
+  filename = NULL,
+  fill = c("red", "blue", "green"),
+  alpha = 0.5,
+  cex = 1.5,
+  cat.cex = 1.2,
+  main = "Diagrama de Venn de genes diferencialmente expresados"
+)
+
+# Mostrar el diagrama de Venn
+grid.draw(venn.plot)
+
+```
+
+Otra alternativa es la utilización de la función DecideTests de Limma para clasificar los genes en "Up", "Down" o "No significativo" para cada contraste permitiendo la comparación de las listas de una manera sencilla. 
+
+```{r}
+comparison <- decideTests(fit_contrasts)
+summary(comparison)
+
+# Visualizamos la comparación como un heatmap
+
+heatmap(as.matrix(comparison),
+        main = "Comparación de genes diferencialmente expresados",
+        cexRow = 0.6,    # Ajusta el tamaño de las etiquetas en el eje Y
+        cexCol = 0.8,    # Ajusta el tamaño de las etiquetas en el eje X
+        margins = c(10, 10))  # Ajusta los márgenes (X, Y)
+```
+
+
+## Anotación de los genes
+
+Primero de todo, como estamos trabajando con modelos murinos, tenemos que utilizar el paquete específico para este organismo, en este caso org.Mm.eg.db
+
+```{r}
+# Instalar paquetes necesarios
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("annotate", "org.Mm.eg.db"))
+
+# Cargar los paquetes
+library(annotate)
+library(org.Mm.eg.db)
+```
+
+Se utiliza la columna rownames de las tablas de genes diferencialmente expresados como identificadores.
+
+```{r}
+probe_ids <- rownames(topTable_Inf_vs_NoInf)
+topTable_Inf_vs_NoInf <- topTable(fit_contrasts, coef = "Infectados_vs_NoInfectados", number = Inf, adjust = "BH")
+
+```
+
+```{r}
+if (!requireNamespace("mouse4302.db", quietly = TRUE)) {
+  BiocManager::install("mouse4302.db")
+}
+# Instalar el paquete de anotación para la plataforma Mouse430
+BiocManager::install("mouse4302.db")
+library(mouse4302.db)
+
+# Mapeamos las IDs de las sondas a Symbol, EntrezID y EnsemblID
+gene_symbols <- mapIds(mouse4302.db, keys = probe_ids, column = "SYMBOL", keytype = "PROBEID", multiVals = "first")
+entrez_ids <- mapIds(mouse4302.db, keys = probe_ids, column = "ENTREZID", keytype = "PROBEID", multiVals = "first")
+ensembl_ids <- mapIds(mouse4302.db, keys = probe_ids, column = "ENSEMBL", keytype = "PROBEID", multiVals = "first")
+
+# Creamos una tabla con las anotaciones
+annotated_genes <- data.frame(
+  ProbeID = probe_ids,
+  Symbol = gene_symbols,
+  EntrezID = entrez_ids,
+  EnsemblID = ensembl_ids,
+  stringsAsFactors = FALSE
+)
+
+head(annotated_genes)
+```
+
+Combinamos las anotaciones con los resultados de los genes
+
+```{r}
+# Combinar las anotaciones con los resultados de Limma
+annotated_results <- merge(annotated_genes, topTable_Inf_vs_NoInf, by.x = "ProbeID", by.y = "row.names")
+
+# Mostrar las primeras filas del resultado combinado
+head(annotated_results)
+
+```
+
+A partir de los resultados obtenidos, podemos generar gráficos para explorar los datos. El gráfico Volcano Plot nos facilita el resaltado de los genes más significativos y con mayores cambios de expresión. 
+
+```{r}
+with(annotated_results, {
+  plot(logFC, -log10(P.Value),
+       pch = 20, main = "Volcano Plot",
+       xlab = "log2 Fold Change", ylab = "-log10 P-value")
+  abline(h = -log10(0.05), col = "red", lty = 2)  # Línea de p-value significativo
+  abline(v = c(-1, 1), col = "blue", lty = 2)     # Líneas para logFC ±1
+})
+
+```
+
+A partir del gráfico, los genes de interes más relevante se situan en las esquinas superiores izquierda y derecha. Estos tienen cambios grandes en la expresión y son altamente significativos. Los genes situados en la esquina superior derecha son genes sobreexpresados y los de la esquina superior izquierda son genes subexpresados. 
+
+Podemos extraer estos genes claves con un ajuste significativo y filtrar la tabla con los sobreexpresados y los subexpresados. 
+
+```{r}
+# Filtrado de  genes sobreexpresados
+upregulated_genes <- annotated_results[annotated_results$logFC > 1 & annotated_results$adj.P.Val < 0.05, ]
+
+# Filtrado de genes subexpresados
+downregulated_genes <- annotated_results[annotated_results$logFC < -1 & annotated_results$adj.P.Val < 0.05, ]
+
+# Número de genes sobre y subexpresados
+cat("Genes sobreexpresados:", nrow(upregulated_genes), "\n")
+cat("Genes subexpresados:", nrow(downregulated_genes), "\n")
+
+head(upregulated_genes)
+head(downregulated_genes)
+
+```
+
+
+## Análisis de la significación biológica
+
+Una vez anotados los genes podemos intentar interpretar los resultados intentando determinar si las listas se encuentran enriquecidas o no en algunas categorias biológicas. 
+Para ello utilizareoms un analisis de sobre-representación o un Gene Set Enrichment Analysis
+
+```{r}
+# Instalar paquetes necesarios
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Mm.eg.db", "enrichplot", "DOSE"))
+
+# Cargar paquetes
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(DOSE)
+
+
+# Preparar el ranking de genes basado en logFC
+gene_list <- annotated_results$logFC
+names(gene_list) <- annotated_results$EntrezID
+gene_list <- sort(gene_list, decreasing = TRUE)
+
+# Realizar GSEA en GO
+gsea_results <- gseGO(
+  geneList = gene_list,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",  # Biología de procesos
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# Visualizar resultados GSEA
+gseaplot2(gsea_results, geneSetID = 1, title = "GSEA: Término GO más significativo")
+```
+
+Este gráfico evalua si un conjunto de genes esta sobreexpresado entre los genes altamente expresados, o subexpresados, en el rankin de genes. 
+La línea verde representa la cumulación del enriquecimiento de los genes del conjunto a lo largo del ranking, un pico alto en la curva indica que los genes del conjunto están enriquecidos. 
+
+Cada marca vertical negra representa un gen en el conjunto. Los genes estan ordenados por su posicion en el ranking (a partir de logFC)
+
+La barra de color roja representa genes sobreexpresados y la de color azul genes subexpresados. 
+
+En la gráfica obtenida, como el pico ocurre en la parte izquierda, nos indica que está enriquecido entre los genes sobreexpresados. Los genes del conjunto tienen un papel relevante en la condición de interes y estan sobreexpresados en el grupo experimental. 
+
+
+A partir de aqui, podemos expresar los resultados del GSEA. Identificamos el nombre del termino GO enriqucido y consultamos el listado de genes asociados al termino, para posteriormente realizar un analisis gráfico a partir de un dotplot
+
+
+```{r}
+# Términos GO más significativos
+head(as.data.frame(gsea_results))
+
+# Genes del término más significativo
+gsea_genes <- gsea_results@result$geneID[1]  # Genes del primer término
+cat("Genes del término enriquecido:", gsea_genes, "\n")
+
+# Dotplot para los principales términos GO enriquecidos
+dotplot(gsea_results, showCategory = 10) + ggtitle("Términos GO enriquecidos (GSEA)")
+```
+
+El eje de las Y nos muestra los términos GO más significativos según el análisis, el eje de las X nos representa la proporcion de genes en el término GO enriquecido y el tamaño del punto nos indica el número de genes en el conjunto que estan asociados al término GO.
+
+
+Podemos realizar, como complemento, un analisis de sobre-representación (ORA), enfocado únicamente en los genes filtrados como significativamente sobreexpresados o subexpresados. 
+
+
+```{r}
+# Extraemos los Entrez IDs de los genes significativos
+upregulated_entrez <- upregulated_genes$EntrezID
+downregulated_entrez <- downregulated_genes$EntrezID
+
+# ORA para genes sobreexpresados en "Biological Process" (BP)
+go_up_BP <- enrichGO(
+  gene = upregulated_entrez,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",  # Ontología: Biological Process
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+# ORA para genes subexpresados en "Biological Process" (BP)
+go_down_BP <- enrichGO(
+  gene = downregulated_entrez,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+```
+
+Ahora, vamos a visualizar los resultados: 
+
+```{r}
+# Términos GO enriquecidos para genes sobreexpresados
+dotplot(go_up_BP, showCategory = 10) + ggtitle("ORA: Términos GO enriquecidos (Sobreexpresados - BP)")
+
+# Términos GO enriquecidos para genes subexpresados
+dotplot(go_down_BP, showCategory = 10) + ggtitle("ORA: Términos GO enriquecidos (Subexpresados - BP)")
+```
+
+
+
+
+También podemos realizar el análisis de enriquecimiento para rutas KEGG para estudiar las rutas metabólicas y moleculares en las que están implicados los genes del experimento. 
+
+```{r}
+# ORA para genes sobreexpresados en rutas KEGG
+kegg_up <- enrichKEGG(
+  gene = upregulated_entrez,
+  organism = "mmu",  # Organismo: mmu = Mus musculus
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+# ORA para genes subexpresados en rutas KEGG
+kegg_down <- enrichKEGG(
+  gene = downregulated_entrez,
+  organism = "mmu",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05
+)
+
+# Visualización de rutas KEGG
+dotplot(kegg_up, showCategory = 10) + ggtitle("ORA: Rutas KEGG enriquecidas (Sobreexpresados)")
+dotplot(kegg_down, showCategory = 10) + ggtitle("ORA: Rutas KEGG enriquecidas (Subexpresados)")
+
+```
+
+
+## Conclusiones finales
+
+Este proyecto ilustra cómo los datos de expresión génica, combinados con herramientas bioinformáticas y estadísticas avanzadas, pueden proporcionar una comprensión detallada de las respuestas biológicas a infecciones bacterianas y tratamientos. Los resultados destacan genes y rutas biológicas importantes que podrían ser objetivos potenciales para futuras investigaciones. Además, se demuestra la utilidad de herramientas como limma y clusterProfiler para realizar análisis completos y visualmente informativos.
+
+El trabajo no solo cumple con los objetivos planteados, sino que también refuerza la importancia de la bioinformática en la investigación biomédica y la capacidad de analizar grandes volúmenes de datos de manera eficiente y significativa.
+
+Los resultados sugieren que los procesos inmunológicos están fuertemente activados en las muestras infectadas, con una respuesta adaptativa modulada por los tratamientos antibióticos. Linezolid y vancomicina afectan distintas vías inmunológicas, lo que destaca su impacto diferencial en la regulación de la respuesta del huésped frente a la infección.
+
+Ambos antibióticos demostraron modular genes que son críticos en la inmunomodulación, aunque la magnitud y el número de genes afectados fueron diferentes.
+
+Linezolid parece tener un impacto más marcado en la regulación de las rutas de señalización inmunológica, mientras que vancomicina mostró un efecto significativo en genes relacionados con respuestas antimicrobianas directas.
